@@ -1,0 +1,130 @@
+from datetime import datetime
+import hashlib
+import os
+from os.path import basename, exists, normpath
+import subprocess
+import sys
+from typing import Sequence
+
+from crontab import CronTab
+
+default_out_path = 'output'
+out_path = os.environ.get('BACKUP_OUTPUT_PATH') ?? default_out_path
+debug_mode = os.environ.get('BACKUP_DEBUG') ?? '0' |> x -> int(x)
+cron_slices_str = os.environ.get('BACKUP_CRON_SLICE')
+cron_force = os.environ.get('BACKUP_FORCE')
+
+file_no_ext = x -> basename(x).split('.')[0]
+first = y -> y[0] if isinstance(y, Sequence) else y
+is_pair = y -> True if isinstance(y, Sequence) and len(y) == 2 else False
+is_singleton = y -> True if isinstance(y, Sequence) and len(y) == 1 else False
+fingerprint = y -> hashlib.sha256(y.encode('utf-8')).hexdigest()
+
+def help_content():
+  f"Usage: {__file__}: [options...] <paths>" |> print
+  "\t-v, --verbose\tEnable debug mode (ENV VAR: BACKUP_DEBUG). -v -v for very verbose." |> print
+  "\t-h, --help\tDisplay this info" |> print
+  "\t-o, --output <path>\tThe directory to copy paths to. (ENV VAR: BACKUP_OUTPUT_PATH)" |> print
+  "\t-c, --cron <tab definition>\tThe cron 'm h dom mon dow' e.g. '0 * * * *' (ENV VAR: BACKUP_CRON_SLICE)" |> print
+  "\t-f, --force\tOverride existing cron job if conflict (ENV VAR: BACKUP_FORCE)." |> print
+  sys.exit(1)
+
+
+def parse_boolean_args(args: Sequence) -> list:
+  """Set boolean flags and parse them out of args."""
+  clean_args = []
+  for arg in args:
+    case arg:
+      match "-v" or "--verbose":
+        global debug_mode
+        debug_mode += 1
+      match "-h" or "--help":
+        help_content()
+      match '-f' or '--force':
+        global cron_force
+        cron_force = True
+    else:
+      clean_args.append(arg)
+  return clean_args
+
+
+def parse_arg(arg_pair: Sequence) -> bool:
+  """Check if arg pair is an option and sets it."""
+  if is_singleton(arg_pair):
+    arg_pair = (arg_pair[0], None)
+  name, value = arg_pair
+  case name:
+    match "-o" or "--output":
+      global out_path
+      if out_path == default_out_path:
+        out_path = value
+      return True
+    match "-c" or "--cron":
+      global cron_slices_str
+      cron_slices_str = value
+      return True
+  return False
+
+
+def log(s: str) = (str(datetime.utcnow())+':', s) |*> print
+def debug(s: str, min_weight: int = 1):
+  if debug_mode >= min_weight:
+    "DEBUG: " + s |> log
+def error(s: str) = log("ERROR: " + s)
+
+def main():
+  # Remove file name from args
+  args = takewhile(x -> file_no_ext(x) != file_no_ext(__file__), reversed(sys.argv)) |> list |> reversed |> list
+  # Remove boolean flags from args
+  args = args |> parse_boolean_args
+  # Group args in pairs, parse args and remove any options from the args
+  paths_to_backup = args |> groupsof$(2) |> filter$(x -> x if not parse_arg(x) else None) |> list
+  # Flatten (the paths will still be grouped)
+  paths_to_backup = [path for paths in paths_to_backup for path in paths]
+
+  # Create the output directory if needed
+  os.path.isdir(out_path) or os.mkdir(out_path)
+
+  ('paths_to_backup: ' + repr(paths_to_backup), 2) |*> debug
+  (f'output: {out_path}', 2) |*> debug
+  (f'force: {cron_force}', 2) |*> debug
+  (f'cron: {cron_slices_str}', 2) |*> debug
+
+  for path in paths_to_backup:
+    if not exists(path):
+      f"{path} does not exist!" |> error
+      continue
+    if os.path.isdir(path):
+      out_file_name = path.split("/") |> reversed |> dropwhile$(x -> len(x) == 0) |> list |> .[0]
+    else:
+      out_file_name = basename(path)
+    rsync_args = ["rsync", "-avz", normpath(path), normpath(f"{out_path}/{out_file_name}")]
+    f"EXEC CMD: {' '.join(rsync_args)}" |> debug
+    subprocess.check_output(rsync_args, stderr=subprocess.STDOUT).decode('utf-8') |> debug
+
+    if cron_slices_str:
+      user_cron  = CronTab(user=True)
+      cmd = " ".join(rsync_args)
+      (f"Existing cron jobs: {repr(user_cron.crons)}", 2) |*> debug
+      # If task already exists
+      try:
+        job = (user_cron.find_comment(fingerprint(cmd))::user_cron.find_command(cmd))$[0]
+        if job:
+          if cron_force:
+            f"Cron job already exists... DELETING {job.comment})" |> debug
+            user_cron.remove(job)
+          else:
+            f"Cron job already exists for {cmd}!" |> error
+            continue
+      except StopIteration:
+        pass
+      job = {'command': cmd, 'comment': fingerprint(cmd)} |**> user_cron.new
+      job.setall(cron_slices_str)
+      if not job.is_valid:
+          f"Cannot create cron job!: {repr(job)}" |> error
+      else:
+        f"Creating cron job: {job}" |> debug
+        user_cron.write()
+
+if __name__ == "__main__":
+  main()
